@@ -15,8 +15,8 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 TOPIC_ID = os.environ.get("TOPIC_ID")  # optional; None/empty/"1" => no thread
 TZ = ZoneInfo(os.environ.get("TZ", "America/Chicago"))
 MAX_EVENTS = int(os.environ.get("MAX_EVENTS", "30"))
-# Importance levels to include: high + medium
-WANTED_IMPORTANCE = {"high", "medium", "moderate"}
+# Set DEBUG_ROWS=0 in Railway variables to silence the per-row sample dump
+DEBUG_ROWS = os.environ.get("DEBUG_ROWS", "1") == "1"
 # -----------------------------------------------
 
 print(f">>> Config: BOT_TOKEN set={bool(BOT_TOKEN)}, "
@@ -25,6 +25,10 @@ print(f">>> Config: BOT_TOKEN set={bool(BOT_TOKEN)}, "
 if not BOT_TOKEN or not CHANNEL_ID:
     print("!!! MISSING REQUIRED ENV VARS (BOT_TOKEN and/or CHANNEL_ID). Exiting.", flush=True)
     sys.exit(1)
+
+
+def normalize(val):
+    return str(val).strip().lower() if val is not None else ""
 
 
 def fetch_events():
@@ -43,39 +47,40 @@ def fetch_events():
     return df
 
 
-def normalize(val):
-    return str(val).strip().lower() if val is not None else ""
-
-
 def filter_us(df):
-    cols = {c.lower(): c for c in df.columns}
-
-    # Find the country/currency column and the importance column flexibly
-    country_col = next((cols[c] for c in cols
-                        if c in ("country", "zone", "currency", "ccy")), None)
-    imp_col = next((cols[c] for c in cols
-                   if "importance" in c or "impact" in c or "volatility" in c), None)
-    name_col = next((cols[c] for c in cols
-                    if c in ("event", "name", "title", "indicator")), None)
-    time_col = next((cols[c] for c in cols
-                    if "time" in c or "date" in c), None)
-
-    print(f">>> Using columns -> country={country_col}, importance={imp_col}, "
-          f"name={name_col}, time={time_col}", flush=True)
+    # One-time sample dump so we can see the real values if anything looks off
+    if DEBUG_ROWS:
+        print(">>> Sample rows (countryCode / currencyCode / Impact / volatility / Name):", flush=True)
+        for _, row in df.head(10).iterrows():
+            print(f"      countryCode={row.get('countryCode')!r}  "
+                  f"currencyCode={row.get('currencyCode')!r}  "
+                  f"Impact={row.get('Impact')!r}  "
+                  f"volatility={row.get('volatility')!r}  "
+                  f"Name={str(row.get('Name'))[:40]!r}", flush=True)
 
     events = []
     for _, row in df.iterrows():
-        country = normalize(row.get(country_col)) if country_col else ""
-        importance = normalize(row.get(imp_col)) if imp_col else ""
+        country = normalize(row.get("countryCode"))    # e.g. 'us'
+        currency = normalize(row.get("currencyCode"))  # e.g. 'usd'
+        impact = normalize(row.get("Impact"))
+        volatility = normalize(row.get("volatility"))
 
-        is_us = any(tok in country for tok in ("united states", "usa", "us", "usd"))
-        is_wanted = any(level in importance for level in WANTED_IMPORTANCE)
+        is_us = country in ("us", "usa") or currency == "usd"
+
+        # Accept either Impact or volatility; handle word labels OR numeric (3=high, 2=medium)
+        level = f"{impact} {volatility}"
+        is_high = any(w in level for w in ("high", "3"))
+        is_medium = any(w in level for w in ("medium", "moderate", "2"))
+        is_wanted = is_high or is_medium
 
         if is_us and is_wanted:
             events.append({
-                "name": row.get(name_col, "(event)") if name_col else "(event)",
-                "time": row.get(time_col, "") if time_col else "",
-                "importance": importance,
+                "name": row.get("Name", "(event)"),
+                "time": row.get("Start", "") or row.get("dateUtc", ""),
+                "level": level,
+                "actual": row.get("actual", ""),
+                "consensus": row.get("consensus", ""),
+                "previous": row.get("previous", ""),
             })
 
     print(f">>> {len(events)} US high+medium events after filtering.", flush=True)
@@ -100,12 +105,30 @@ def send_telegram(text):
     return resp.json()
 
 
-def importance_icon(imp):
-    if "high" in imp:
+def importance_icon(level):
+    level = normalize(level)
+    if "high" in level or "3" in level:
         return "🔴"
-    if "medium" in imp or "moderate" in imp:
+    if "medium" in level or "moderate" in level or "2" in level:
         return "🟠"
     return "⚪"
+
+
+def fmt_time(raw):
+    """Try to show just HH:MM in the user's timezone; fall back to raw string."""
+    if not raw:
+        return ""
+    s = str(raw)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(s.replace("Z", "+0000"), fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            return dt.astimezone(TZ).strftime("%H:%M")
+        except ValueError:
+            continue
+    return s  # unknown format: show as-is
 
 
 def post_calendar():
@@ -133,18 +156,29 @@ def post_calendar():
 
     lines = [f"<b>🇺🇸 US Economic Calendar — {date_str}</b>", ""]
     for e in events:
-        icon = importance_icon(normalize(e["importance"]))
-        t = str(e["time"]).strip()
+        icon = importance_icon(e["level"])
+        t = fmt_time(e["time"])
         t_part = f"<code>{t}</code> " if t else ""
-        lines.append(f"{icon} {t_part}{e['name']}")
+        line = f"{icon} {t_part}{e['name']}"
+
+        # Append forecast/previous if present (useful at a glance)
+        extras = []
+        if str(e.get("consensus", "")).strip():
+            extras.append(f"f/c {e['consensus']}")
+        if str(e.get("previous", "")).strip():
+            extras.append(f"prev {e['previous']}")
+        if extras:
+            line += f"  <i>({', '.join(extras)})</i>"
+
+        lines.append(line)
 
     message = "\n".join(lines)
 
-    # Telegram caps messages at ~4096 chars; split if needed
     try:
         if len(message) <= 4000:
             send_telegram(message)
         else:
+            # Split into chunks under Telegram's ~4096 char limit
             chunk, length = [], 0
             for line in lines:
                 if length + len(line) > 3500:
