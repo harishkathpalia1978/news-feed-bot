@@ -1,106 +1,85 @@
 import os
 import sys
-import requests
-import xml.etree.ElementTree as ET
-import json
 import time
-from datetime import datetime, timedelta
-from email.utils import parsedate_to_datetime
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 print(">>> SCRIPT STARTED", flush=True)
 
+import requests
+from ecocal import Calendar
+
 # ---------- CONFIG (from environment) ----------
-RSS_URL = "https://www.investing.com/rss/news.rss"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 TOPIC_ID = os.environ.get("TOPIC_ID")  # optional; None/empty/"1" => no thread
 TZ = ZoneInfo(os.environ.get("TZ", "America/Chicago"))
-MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "10"))
-SEEN_FILE = os.environ.get("SEEN_FILE", "seen_articles.json")
-WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "24"))
+MAX_EVENTS = int(os.environ.get("MAX_EVENTS", "30"))
+# Importance levels to include: high + medium
+WANTED_IMPORTANCE = {"high", "medium", "moderate"}
 # -----------------------------------------------
 
 print(f">>> Config: BOT_TOKEN set={bool(BOT_TOKEN)}, "
-      f"CHANNEL_ID={CHANNEL_ID}, TOPIC_ID={TOPIC_ID}, "
-      f"TZ={TZ}, MAX_ARTICLES={MAX_ARTICLES}, WINDOW_HOURS={WINDOW_HOURS}", flush=True)
+      f"CHANNEL_ID={CHANNEL_ID}, TOPIC_ID={TOPIC_ID}, TZ={TZ}", flush=True)
 
 if not BOT_TOKEN or not CHANNEL_ID:
-    print("!!! MISSING REQUIRED ENV VARS (BOT_TOKEN and/or CHANNEL_ID). "
-          "Set them in Railway > Variables. Exiting.", flush=True)
+    print("!!! MISSING REQUIRED ENV VARS (BOT_TOKEN and/or CHANNEL_ID). Exiting.", flush=True)
     sys.exit(1)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
-}
+
+def fetch_events():
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    print(f">>> Fetching economic calendar for {today}...", flush=True)
+
+    cal = Calendar(
+        startHorizon=today,
+        endHorizon=today,
+        withDetails=True,
+        nbThreads=10,
+    )
+    df = cal.getCalendar() if hasattr(cal, "getCalendar") else cal.calendar
+    print(f">>> Calendar returned {len(df)} total events.", flush=True)
+    print(f">>> Available columns: {list(df.columns)}", flush=True)
+    return df
 
 
-def parse_pubdate(raw):
-    """Handle both 'YYYY-MM-DD HH:MM:SS' and RFC822 feed date formats."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    try:
-        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=ZoneInfo("UTC"))
-    except ValueError:
-        pass
-    try:
-        return parsedate_to_datetime(raw)
-    except Exception:
-        return None
+def normalize(val):
+    return str(val).strip().lower() if val is not None else ""
 
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        try:
-            with open(SEEN_FILE) as f:
-                data = set(json.load(f))
-                print(f">>> Loaded {len(data)} seen articles from {SEEN_FILE}", flush=True)
-                return data
-        except Exception as e:
-            print(f">>> Could not read seen file ({e}); starting empty.", flush=True)
-            return set()
-    print(f">>> No seen file at {SEEN_FILE}; starting empty.", flush=True)
-    return set()
+def filter_us(df):
+    cols = {c.lower(): c for c in df.columns}
 
+    # Find the country/currency column and the importance column flexibly
+    country_col = next((cols[c] for c in cols
+                        if c in ("country", "zone", "currency", "ccy")), None)
+    imp_col = next((cols[c] for c in cols
+                   if "importance" in c or "impact" in c or "volatility" in c), None)
+    name_col = next((cols[c] for c in cols
+                    if c in ("event", "name", "title", "indicator")), None)
+    time_col = next((cols[c] for c in cols
+                    if "time" in c or "date" in c), None)
 
-def save_seen(seen):
-    try:
-        with open(SEEN_FILE, "w") as f:
-            json.dump(list(seen), f)
-        print(f">>> Saved {len(seen)} seen articles.", flush=True)
-    except Exception as e:
-        print(f">>> Could not save seen file: {e}", flush=True)
+    print(f">>> Using columns -> country={country_col}, importance={imp_col}, "
+          f"name={name_col}, time={time_col}", flush=True)
 
+    events = []
+    for _, row in df.iterrows():
+        country = normalize(row.get(country_col)) if country_col else ""
+        importance = normalize(row.get(imp_col)) if imp_col else ""
 
-def fetch_news():
-    print(f">>> Fetching feed: {RSS_URL}", flush=True)
-    resp = requests.get(RSS_URL, headers=HEADERS, timeout=15)
-    print(f">>> Feed HTTP status: {resp.status_code}, body length: {len(resp.content)} bytes", flush=True)
-    resp.raise_for_status()
+        is_us = any(tok in country for tok in ("united states", "usa", "us", "usd"))
+        is_wanted = any(level in importance for level in WANTED_IMPORTANCE)
 
-    root = ET.fromstring(resp.content)
-    items = root.findall(".//item")
-    print(f">>> Feed contained {len(items)} <item> entries.", flush=True)
+        if is_us and is_wanted:
+            events.append({
+                "name": row.get(name_col, "(event)") if name_col else "(event)",
+                "time": row.get(time_col, "") if time_col else "",
+                "importance": importance,
+            })
 
-    news = []
-    for item in items:
-        title = item.findtext("title", default="(no title)")
-        link = item.findtext("link", default="")
-        pub_date_raw = item.findtext("pubDate", default="")
-        pub_dt = parse_pubdate(pub_date_raw)
-        news.append({"title": title, "link": link, "pub_dt": pub_dt})
-    return news
-
-
-def is_recent(pub_dt, hours):
-    if pub_dt is None:
-        return False
-    cutoff = datetime.now(TZ) - timedelta(hours=hours)
-    return pub_dt.astimezone(TZ) >= cutoff
+    print(f">>> {len(events)} US high+medium events after filtering.", flush=True)
+    return events[:MAX_EVENTS]
 
 
 def send_telegram(text):
@@ -109,7 +88,7 @@ def send_telegram(text):
         "chat_id": CHANNEL_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": True,
     }
     if TOPIC_ID and TOPIC_ID not in ("1", ""):
         payload["message_thread_id"] = int(TOPIC_ID)
@@ -121,49 +100,66 @@ def send_telegram(text):
     return resp.json()
 
 
-def post_daily_news():
-    print(f">>> [{datetime.now(TZ)}] Running daily news job...", flush=True)
-    seen = load_seen()
+def importance_icon(imp):
+    if "high" in imp:
+        return "🔴"
+    if "medium" in imp or "moderate" in imp:
+        return "🟠"
+    return "⚪"
+
+
+def post_calendar():
+    print(f">>> [{datetime.now(TZ)}] Running economic calendar job...", flush=True)
 
     try:
-        articles = fetch_news()
+        df = fetch_events()
     except Exception as e:
-        print(f"!!! Failed to fetch news: {e}", flush=True)
+        print(f"!!! Failed to fetch calendar: {e}", flush=True)
         return
 
-    print(f">>> Fetched {len(articles)} articles total. Sample of newest:", flush=True)
-    for a in articles[:5]:
-        print(f"      pub_dt={a['pub_dt']}  title={a['title'][:60]}", flush=True)
-    print(f">>> Now in {TZ}: {datetime.now(TZ)}; window = last {WINDOW_HOURS}h", flush=True)
-
-    recent = [a for a in articles if is_recent(a["pub_dt"], WINDOW_HOURS) and a["link"] not in seen]
-    print(f">>> {len(recent)} articles pass the recency+unseen filter.", flush=True)
-    recent = recent[:MAX_ARTICLES]
-
-    if not recent:
-        print(">>> Nothing to post. Exiting.", flush=True)
+    try:
+        events = filter_us(df)
+    except Exception as e:
+        print(f"!!! Failed to filter events: {e}", flush=True)
         return
 
-    date_str = datetime.now(TZ).strftime("%B %d, %Y")
-    print(f">>> Posting header + {len(recent)} articles...", flush=True)
-    send_telegram(f"<b>📰 Financial News — {date_str}</b>")
+    date_str = datetime.now(TZ).strftime("%A, %B %d, %Y")
 
-    posted = 0
-    for a in recent:
-        msg = f"<b>{a['title']}</b>\n{a['link']}"
-        try:
-            send_telegram(msg)
-            seen.add(a["link"])
-            posted += 1
-            print(f">>> Posted: {a['title'][:60]}", flush=True)
-            time.sleep(2)
-        except Exception as e:
-            print(f"!!! Failed to post '{a['title'][:40]}': {e}", flush=True)
+    if not events:
+        print(">>> No US high/medium events today. Posting 'nothing scheduled' note.", flush=True)
+        send_telegram(f"<b>🇺🇸 US Economic Calendar — {date_str}</b>\n\n"
+                      f"No high or medium importance events scheduled today.")
+        return
 
-    save_seen(seen)
-    print(f">>> Done. Posted {posted} of {len(recent)} articles.", flush=True)
+    lines = [f"<b>🇺🇸 US Economic Calendar — {date_str}</b>", ""]
+    for e in events:
+        icon = importance_icon(normalize(e["importance"]))
+        t = str(e["time"]).strip()
+        t_part = f"<code>{t}</code> " if t else ""
+        lines.append(f"{icon} {t_part}{e['name']}")
+
+    message = "\n".join(lines)
+
+    # Telegram caps messages at ~4096 chars; split if needed
+    try:
+        if len(message) <= 4000:
+            send_telegram(message)
+        else:
+            chunk, length = [], 0
+            for line in lines:
+                if length + len(line) > 3500:
+                    send_telegram("\n".join(chunk))
+                    time.sleep(1)
+                    chunk, length = [], 0
+                chunk.append(line)
+                length += len(line) + 1
+            if chunk:
+                send_telegram("\n".join(chunk))
+        print(f">>> Posted {len(events)} events.", flush=True)
+    except Exception as e:
+        print(f"!!! Failed to post: {e}", flush=True)
 
 
 if __name__ == "__main__":
-    post_daily_news()
+    post_calendar()
     print(">>> SCRIPT FINISHED", flush=True)
