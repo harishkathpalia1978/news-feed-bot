@@ -1,2 +1,3 @@
 requests
-ecocal
+ecocal==1.2.1
+pandas==2.1.4
